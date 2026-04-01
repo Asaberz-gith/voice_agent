@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Impero AI Voice Agent</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 600px;
+            margin: 60px auto;
+            text-align: center;
+            background: #0f0f0f;
+            color: #fff;
+        }
+        h1 { font-size: 2rem; margin-bottom: 10px; }
+        p { color: #aaa; margin-bottom: 40px; }
+        #status-circle {
+            width: 80px;
+            height: 80px;
+            border-radius: 50%;
+            background: #333;
+            margin: 0 auto 20px;
+            transition: background 0.2s;
+        }
+        #status-circle.listening { background: #1db954; }
+        #status-circle.recording { background: #e53935; }
+        #status-circle.processing { background: #f5a623; }
+        #status-text { color: #aaa; margin-bottom: 40px; font-size: 1rem; }
+        #log {
+            margin-top: 40px;
+            text-align: left;
+            background: #1a1a1a;
+            padding: 20px;
+            border-radius: 12px;
+            min-height: 200px;
+            font-size: 0.95rem;
+            line-height: 1.6;
+        }
+        .user { color: #1db954; }
+        .agent { color: #fff; }
+        .status { color: #aaa; font-style: italic; }
+        .link { margin-top: 6px; }
+    </style>
+</head>
+<body>
+    <h1>🎙️ Impero AI Voice Agent</h1>
+    <div id="status-circle"></div>
+    <p id="status-text">Starting...</p>
+    <div id="log"></div>
+
+<script>
+    const ws = new WebSocket("ws://localhost:8000/ws");
+    const circle = document.getElementById("status-circle");
+    const statusText = document.getElementById("status-text");
+    const log = document.getElementById("log");
+
+    let audioQueue = [];
+    let isPlaying = false;
+    let currentAudio = null;
+
+    // VAD settings
+    const SILENCE_THRESHOLD = 35;   // volume level to detect speech (adjust if needed)
+    const SILENCE_TIMEOUT = 1500;   // ms of silence before stopping
+    const MIN_SPEECH_DURATION = 1000; // ms of speech before we consider it valid
+
+    let isRecording = false;
+    let isSpeaking = false;
+    let audioChunks = [];
+    let mediaRecorder;
+    let silenceTimer = null;
+    let speechStartTime = null;
+    let analyser;
+    let stream;
+
+    function setStatus(state, text) {
+        circle.className = "";
+        circle.classList.add(state);
+        statusText.textContent = text;
+    }
+
+    // WebSocket messages
+    ws.onmessage = async (event) => {
+        if (event.data instanceof Blob) {
+            audioQueue.push(event.data);
+            if (!isPlaying) playNext();
+        } else if (event.data.startsWith("USER:")) {
+            addLog("user", event.data.replace("USER: ", "You: "));
+        } else if (event.data.startsWith("LINK:")) {
+            const url = event.data.replace("LINK:", "").trim();
+            addLink(url);
+        } else if (event.data === "DONE") {
+            setStatus("listening", "Listening...");
+        }
+    };
+
+    // Audio playback
+    async function playNext() {
+        if (audioQueue.length === 0) {
+            isPlaying = false;
+            currentAudio = null;
+            return;
+        }
+        isPlaying = true;
+        const blob = audioQueue.shift();
+        const url = URL.createObjectURL(blob);
+        currentAudio = new Audio(url);
+        currentAudio.onended = () => {
+            URL.revokeObjectURL(url);
+            playNext();
+        };
+        currentAudio.play();
+    }
+
+    function stopAllAudio() {
+        if (currentAudio) {
+            currentAudio.pause();
+            currentAudio.src = "";
+            currentAudio = null;
+        }
+        audioQueue = [];
+        isPlaying = false;
+    }
+
+    // VAD — continuously monitor mic volume
+    async function startVAD() {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const audioContext = new AudioContext();
+        const source = audioContext.createMediaStreamSource(stream);
+        analyser = audioContext.createAnalyser();
+        analyser.fftSize = 512;
+        source.connect(analyser);
+
+        const dataArray = new Uint8Array(analyser.frequencyBinCount);
+
+        setStatus("listening", "Listening...");
+
+        function monitor() {
+            analyser.getByteFrequencyData(dataArray);
+            const volume = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
+
+            if (volume > SILENCE_THRESHOLD) {
+                // Speech detected
+                if (!isRecording) {
+                    startRecording();
+                }
+                // Reset silence timer
+                if (silenceTimer) {
+                    clearTimeout(silenceTimer);
+                    silenceTimer = null;
+                }
+            } else {
+                // Silence detected
+                if (isRecording && !silenceTimer) {
+                    silenceTimer = setTimeout(() => {
+                        stopRecording();
+                    }, SILENCE_TIMEOUT);
+                }
+            }
+
+            requestAnimationFrame(monitor);
+        }
+
+        monitor();
+    }
+
+    function startRecording() {
+        if (isRecording) return;
+        isRecording = true;
+        speechStartTime = Date.now();
+        audioChunks = [];
+
+        // Stop agent if it was speaking
+        stopAllAudio();
+        ws.send("INTERRUPT");
+
+        setStatus("recording", "Speaking...");
+
+        mediaRecorder = new MediaRecorder(stream, { mimeType: "audio/webm" });
+        mediaRecorder.ondataavailable = e => audioChunks.push(e.data);
+        mediaRecorder.start();
+    }
+
+    function stopRecording() {
+        if (!isRecording) return;
+        isRecording = false;
+        silenceTimer = null;
+
+        const duration = Date.now() - speechStartTime;
+
+        mediaRecorder.stop();
+        mediaRecorder.onstop = async () => {
+            // Ignore very short recordings (noise)
+            if (duration < MIN_SPEECH_DURATION) {
+                setStatus("listening", "Listening...");
+                return;
+            }
+            setStatus("processing", "Processing...");
+            const blob = new Blob(audioChunks, { type: "audio/wav" });
+            ws.send(await blob.arrayBuffer());
+            addLog("status", "Processing...");
+        };
+    }
+
+    function addLog(type, text) {
+        const div = document.createElement("div");
+        div.className = type;
+        div.textContent = text;
+        log.appendChild(div);
+        log.scrollTop = log.scrollHeight;
+    }
+
+    function addLink(url) {
+        const div = document.createElement("div");
+        div.className = "agent link";
+        div.innerHTML = `🔗 <a href="${url}" target="_blank" style="color:#1db954;">${url}</a>`;
+        log.appendChild(div);
+        log.scrollTop = log.scrollHeight;
+    }
+
+    // Start on load
+    ws.onopen = () => startVAD();
+</script>
+</body>
+</html>
